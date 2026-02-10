@@ -50,6 +50,7 @@ class AgentMaskSAC():
                  device: torch.device = torch.device("cpu"),
                  action_wrapper_method: str = "reweight",
                  T: float = 1.0,
+                 if_use_tqdm: bool = True,
                  ):
 
         self.act_lr = act_lr
@@ -80,6 +81,7 @@ class AgentMaskSAC():
         self.state_value_tau = state_value_tau
 
         self.last_state = None
+        self.if_use_tqdm = if_use_tqdm
 
         self.rep = NET.build(rep_net).to(self.device)
         self.act = self.act_target = NET.build(act_net).to(self.device)
@@ -248,7 +250,7 @@ class AgentMaskSAC():
         optimizer: `optimizer = torch.optim.SGD(net.parameters(), learning_rate)`
         objective: `objective = net(...)` the optimization objective, sometimes is a loss function.
         """
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         objective.backward()
         clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
         optimizer.step()
@@ -266,7 +268,7 @@ class AgentMaskSAC():
         """
         amp_scale = torch.cuda.amp.GradScaler()  # write in __init__()
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         amp_scale.scale(objective).backward()  # loss.backward()
         amp_scale.unscale_(optimizer)  # amp
 
@@ -290,19 +292,26 @@ class AgentMaskSAC():
     def update_net(self, buffer: ReplayBuffer) -> dict:
 
         '''update network'''
-        obj_critics = 0.0
-        obj_actors = 0.0
-        alphas = 0.0
-        rep_losses = 0.0
-        beta_losses = 0.0
+        obj_critics = torch.zeros((), device=self.device)
+        obj_actors = torch.zeros((), device=self.device)
+        alphas = torch.zeros((), device=self.device)
+        rep_losses = torch.zeros((), device=self.device)
+        beta_losses = torch.zeros((), device=self.device)
 
         update_times = int(self.repeat_times)
 
         assert update_times >= 1
-        for _ in tqdm(range(update_times),bar_format="update net batch " + "{bar:50}{percentage:3.0f}%|{elapsed}/{remaining}{postfix}"):
+        updates = range(update_times)
+        if self.if_use_tqdm:
+            updates = tqdm(
+                updates,
+                bar_format="update net batch " + "{bar:50}{percentage:3.0f}%|{elapsed}/{remaining}{postfix}",
+            )
+
+        for _ in updates:
             '''objective of critic (loss function of critic)'''
             obj_critic, state, mask, ids_restore, rep_states = self.get_obj_critic(buffer, self.batch_size)
-            obj_critics += obj_critic.item()
+            obj_critics += obj_critic.detach()
             self.optimizer_update(self.cri_optimizer, obj_critic, self.cri_scheduler, self.global_step)
             self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
@@ -313,24 +322,24 @@ class AgentMaskSAC():
 
             '''objective of actor'''
             alpha = self.alpha_log.exp().detach()
-            alphas += alpha.item()
+            alphas += alpha.mean()
             with torch.no_grad():
                 self.alpha_log[:] = self.alpha_log.clamp(-16, 2)
             q_value_pg = self.cri_target(rep_states, action_pg).mean()
             obj_actor = (q_value_pg - log_prob * alpha).mean()
-            obj_actors += obj_actor.item()
+            obj_actors += obj_actor.detach()
             self.optimizer_update(self.act_optimizer, -obj_actor, self.act_scheduler, self.global_step)
 
             '''objective of beta (loss function of beta)'''
             if self.if_use_beta:
                 beta_loss = self.get_object_beta(rep_states, mask, ids_restore)
                 self.optimizer_update(self.beta_optimizer, beta_loss, lr_scheduler=self.beta_scheduler, step=self.global_step)
-                beta_losses += beta_loss.item()
+                beta_losses += beta_loss.detach()
 
             '''objective of rep net (loss function of reconstruction)'''
             if self.if_use_rep:
                 rep_loss = self.update_rep_net(state, mask, ids_restore, lr_scheduler=self.rep_scheduler, step=self.global_step)
-                rep_losses += rep_loss.item()
+                rep_losses += rep_loss.detach()
 
             self.global_step += 1
 
@@ -339,14 +348,14 @@ class AgentMaskSAC():
         alpha_lr = self.alpha_optimizer.param_groups[0]["lr"]
 
         stats = {
-            "obj_critics":obj_critics / update_times,
-            "obj_actors":obj_actors / update_times,
-            "alphas":alphas / update_times,
+            "obj_critics": (obj_critics / update_times).item(),
+            "obj_actors": (obj_actors / update_times).item(),
+            "alphas": (alphas / update_times).item(),
             "act_lr":act_lr,
             "cri_lr":cri_lr,
             "alpha_lr":alpha_lr,
-            "rep_losses": rep_losses / update_times,
-            "beta_losses": beta_losses / update_times,
+            "rep_losses": (rep_losses / update_times).item(),
+            "beta_losses": (beta_losses / update_times).item(),
         }
 
         return stats

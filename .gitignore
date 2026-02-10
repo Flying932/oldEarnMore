@@ -6,6 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+# 忽略所有实验产出目录
+workdir/
+# 额外保险：忽略所有 txt 日志和模型权重
+*.txt
+*.pth
+*.pkl
+
 # Distribution / packaging
 .Python
 build/
