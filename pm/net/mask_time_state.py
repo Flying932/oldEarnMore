@@ -148,6 +148,9 @@ class MaskTimeState(MAE):
                 mask_ratio_max: float = 1.0,
                 mask_ratio_mu: float = 0.55,
                 mask_ratio_std:float = 0.25,
+                contrastive_dim: int = None,
+                contrastive_temperature: float = 0.2,
+                corr_positive_weight: float = 0.5,
                 ** kwargs
                 ):
         super(MaskTimeState, self).__init__(
@@ -191,6 +194,14 @@ class MaskTimeState(MAE):
                 for i in range(decoder_depth)
             ]
         )
+        self.contrastive_dim = embed_dim if contrastive_dim is None else contrastive_dim
+        self.contrastive_temperature = contrastive_temperature
+        self.corr_positive_weight = corr_positive_weight
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(embed_dim, self.contrastive_dim),
+            nn.GELU(),
+            nn.Linear(self.contrastive_dim, self.contrastive_dim),
+        )
 
         self.initialize_weights()
 
@@ -232,6 +243,9 @@ class MaskTimeState(MAE):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def _build_full_ids_restore(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+
     def forward_encoder(self, x, mask = None, ids_restore = None, if_mask = True):
         """
         b, c, n, d, f = x.shape # batch size, in chans, num stocks, days, features
@@ -250,6 +264,10 @@ class MaskTimeState(MAE):
                 x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
         else:
             ids_keep = torch.arange(0, L).unsqueeze(0).repeat(B, 1).to(x.device)
+            if mask is None:
+                mask = torch.zeros((B, L), device=x.device, dtype=torch.float32)
+            if ids_restore is None:
+                ids_restore = self._build_full_ids_restore(B, L, x.device)
 
         # append cls token
         if self.cls_embed:
@@ -393,17 +411,20 @@ class MaskTimeState(MAE):
 
         return x
 
-    def forward_state(self,x, mask = None, ids_restore = None):
+    def forward_state(self, x, mask=None, ids_restore=None, if_mask: bool = True):
         if len(x.shape) == 4:
             x = x.unsqueeze(1)
 
         x, mask, ids_restore = self.forward_encoder(x,
                                                     mask = mask,
-                                                    ids_restore = ids_restore)
+                                                    ids_restore = ids_restore,
+                                                    if_mask = if_mask)
 
         N = x.shape[0]
         T = self.patch_embed.t_grid_size
         H = W = self.patch_embed.grid_size
+        if ids_restore is None:
+            ids_restore = self._build_full_ids_restore(N, T * H * W, x.device)
 
         # embed tokens
         x = self.decoder_embed(x)
@@ -461,6 +482,91 @@ class MaskTimeState(MAE):
             x = x[:, :, :]
 
         return x, mask, ids_restore
+
+    @staticmethod
+    def nt_xent_loss(z1, z2, temperature=0.2):
+        z1 = F.normalize(z1, dim=-1)
+        z2 = F.normalize(z2, dim=-1)
+        z = torch.cat([z1, z2], dim=0)  # [2B, C]
+        logits = torch.matmul(z, z.t()) / temperature
+        bsz = z1.shape[0]
+        labels = torch.arange(2 * bsz, device=z.device)
+        labels = (labels + bsz) % (2 * bsz)
+        self_mask = torch.eye(2 * bsz, dtype=torch.bool, device=z.device)
+        mask_value = torch.finfo(logits.dtype).min
+        logits = logits.masked_fill(self_mask, mask_value)
+        return F.cross_entropy(logits.float(), labels)
+
+    def _flatten_contrastive_tokens(self, z: torch.Tensor) -> torch.Tensor:
+        return z.reshape(-1, z.shape[-1])
+
+    def forward_pretrain(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor = None,
+        lambda_recon: float = 1.0,
+        lambda_contrastive: float = 0.7,
+        temperature: float = None,
+        corr_pos_index: torch.Tensor = None,
+        corr_positive_weight: float = None,
+        mask: torch.Tensor = None,
+        ids_restore: torch.Tensor = None,
+    ):
+        if temperature is None:
+            temperature = self.contrastive_temperature
+        if corr_positive_weight is None:
+            corr_positive_weight = self.corr_positive_weight
+        corr_positive_weight = float(min(max(corr_positive_weight, 0.0), 1.0))
+
+        if x2 is None:
+            x2 = x1
+
+        if len(x1.shape) == 4:
+            x1 = x1.unsqueeze(1)
+        if len(x2.shape) == 4:
+            x2 = x2.unsqueeze(1)
+
+        recon_loss, recon_mask, recon_ids_restore = self.forward(
+            x1,
+            mask=mask,
+            ids_restore=ids_restore,
+        )
+
+        h1, _, _ = self.forward_encoder(x1, if_mask=False)
+        h2, _, _ = self.forward_encoder(x2, if_mask=False)
+        z1 = self.contrastive_head(h1)
+        z2 = self.contrastive_head(h2)
+
+        z1_flat = self._flatten_contrastive_tokens(z1)
+        z2_flat = self._flatten_contrastive_tokens(z2)
+        contrastive_same = self.nt_xent_loss(z1_flat, z2_flat, temperature=temperature)
+
+        contrastive_corr = torch.zeros_like(contrastive_same)
+        if corr_pos_index is not None:
+            if not torch.is_tensor(corr_pos_index):
+                corr_pos_index = torch.as_tensor(corr_pos_index, dtype=torch.long)
+            corr_pos_index = corr_pos_index.to(z2.device, dtype=torch.long)
+            corr_pos_index = corr_pos_index.clamp(0, z2.shape[1] - 1)
+            z2_corr = torch.index_select(z2, dim=1, index=corr_pos_index)
+            z2_corr_flat = self._flatten_contrastive_tokens(z2_corr)
+            contrastive_corr = self.nt_xent_loss(z1_flat, z2_corr_flat, temperature=temperature)
+            contrastive_loss = (
+                (1.0 - corr_positive_weight) * contrastive_same
+                + corr_positive_weight * contrastive_corr
+            )
+        else:
+            contrastive_loss = contrastive_same
+
+        total_loss = lambda_recon * recon_loss + lambda_contrastive * contrastive_loss
+        return {
+            "loss_total": total_loss,
+            "loss_recon": recon_loss,
+            "loss_contrastive": contrastive_loss,
+            "loss_contrastive_same": contrastive_same,
+            "loss_contrastive_corr": contrastive_corr,
+            "mask": recon_mask,
+            "ids_restore": recon_ids_restore,
+        }
 
     def forward_loss(self, imgs, pred, mask):
         """

@@ -7,6 +7,8 @@ from .sac import ActorSAC
 from .sac import CriticSAC
 from .sac import ActorMaskSAC
 from .sac import CriticMaskSAC
+from .sac import ResidualLightweightAdapter
+from .sac import FrozenRepAdapterHierarchical
 from .ddpg import ActorDDPG
 from .ddpg import CriticDDPG
 from .TD3 import ActorTD3
@@ -26,6 +28,8 @@ __all__ = [
     "CriticPPO",
     "ActorMaskSAC",
     "CriticMaskSAC",
+    "ResidualLightweightAdapter",
+    "FrozenRepAdapterHierarchical",
     "ActorDDPG",
     "CriticDDPG",
     "ActorTD3",
