@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python tools/train.py --config configs/mask_sac/mask_sac_nepx2000_daysx10_bsx32_bufsx50000_hlx32_edx64_depx1_dedx64_dedepx1_rtx8_lrx1e-05_sdx42_nvx1_vecxsync_bufdevxcpu_actlrx1e-05_crilrx1e-05_replrx1e-05_betlrx1e-05_repwx1.0_betwx0.01_awmxreweight_Tx0.1_dj30_dgx0.py
